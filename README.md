@@ -2,6 +2,11 @@
 
 EasyCopy 是一款 macOS 剪贴板历史管理工具。它常驻菜单栏，自动记录文本和图片剪贴板内容，并通过全局快捷键在鼠标附近呼出一个轻量浮窗，方便快速搜索、选择和粘贴历史内容。
 
+## 官网与下载
+
+- 官网：<https://trapdope.github.io/easy-copy/>
+- macOS Apple Silicon 下载包：[`docs/downloads/EasyCopy-0.1.0-macOS-arm64.dmg`](docs/downloads/EasyCopy-0.1.0-macOS-arm64.dmg)
+
 ## 功能特性
 
 - 菜单栏常驻运行，不占用 Dock 图标
@@ -130,4 +135,3 @@ EasyCopy 会将历史记录和设置保存在应用数据目录中：
 - 自动粘贴依赖辅助功能权限
 - 图片历史会占用更多本地存储空间
 - 未签名构建在首次打开时可能触发 macOS 安全提示
-

@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EasyCopy - macOS 剪贴板历史管理工具</title>
+    <meta
+      name="description"
+      content="EasyCopy 是一款 macOS 菜单栏剪贴板历史管理工具，支持文本、图片、搜索、快捷粘贴和自定义快捷键。"
+    />
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f5f5f7;
+        --surface: rgba(255, 255, 255, 0.78);
+        --surface-strong: rgba(255, 255, 255, 0.92);
+        --text: #1d1d1f;
+        --muted: #6e6e73;
+        --line: rgba(0, 0, 0, 0.09);
+        --blue: #155bd0;
+        --green: #217a43;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background:
+          radial-gradient(circle at 30% 10%, rgba(21, 91, 208, 0.11), transparent 34%),
+          linear-gradient(180deg, #fbfbfd 0%, var(--bg) 42%, #ffffff 100%);
+        color: var(--text);
+        font-family:
+          -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+      }
+
+      a {
+        color: inherit;
+      }
+
+      .page {
+        min-height: 100vh;
+      }
+
+      .nav {
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.62);
+        background: rgba(245, 245, 247, 0.72);
+        backdrop-filter: blur(20px);
+      }
+
+      .nav-inner,
+      .section {
+        width: min(1040px, calc(100% - 40px));
+        margin: 0 auto;
+      }
+
+      .nav-inner {
+        display: flex;
+        height: 58px;
+        align-items: center;
+        justify-content: space-between;
+        gap: 18px;
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 14px;
+        font-weight: 650;
+      }
+
+      .brand img {
+        width: 28px;
+        height: 28px;
+        border-radius: 8px;
+      }
+
+      .nav-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .nav-actions a {
+        text-decoration: none;
+      }
+
+      .hero {
+        display: grid;
+        min-height: calc(100vh - 58px);
+        grid-template-columns: minmax(0, 1fr) 390px;
+        align-items: center;
+        gap: 52px;
+        padding: 60px 0 42px;
+      }
+
+      .eyebrow {
+        margin: 0 0 14px;
+        color: var(--blue);
+        font-size: 13px;
+        font-weight: 650;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(44px, 7vw, 78px);
+        line-height: 0.95;
+        letter-spacing: 0;
+      }
+
+      .hero-copy {
+        max-width: 660px;
+        margin: 20px 0 0;
+        color: var(--muted);
+        font-size: 19px;
+        line-height: 1.62;
+      }
+
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-top: 30px;
+      }
+
+      .button {
+        display: inline-flex;
+        min-height: 42px;
+        align-items: center;
+        justify-content: center;
+        border-radius: 999px;
+        padding: 0 18px;
+        border: 1px solid var(--line);
+        background: var(--surface-strong);
+        color: var(--text);
+        font-size: 14px;
+        font-weight: 650;
+        text-decoration: none;
+      }
+
+      .button.primary {
+        border-color: rgba(21, 91, 208, 0.28);
+        background: var(--blue);
+        color: white;
+      }
+
+      .meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 18px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .meta span {
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.58);
+        padding: 6px 10px;
+      }
+
+      .preview {
+        overflow: hidden;
+        border: 1px solid rgba(255, 255, 255, 0.76);
+        border-radius: 24px;
+        background: rgba(255, 255, 255, 0.52);
+        backdrop-filter: blur(28px);
+      }
+
+      .preview-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.78);
+        padding: 16px;
+      }
+
+      .preview-title {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 14px;
+        font-weight: 650;
+      }
+
+      .preview-title img {
+        width: 32px;
+        height: 32px;
+        border-radius: 9px;
+      }
+
+      .preview-count {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .search {
+        margin: 14px 16px 8px;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.78);
+        color: var(--muted);
+        padding: 10px 12px;
+        font-size: 13px;
+      }
+
+      .items {
+        display: grid;
+        gap: 8px;
+        padding: 8px 12px 16px;
+      }
+
+      .item {
+        display: grid;
+        grid-template-columns: 34px 1fr auto;
+        gap: 10px;
+        align-items: center;
+        border-radius: 14px;
+        background: rgba(255, 255, 255, 0.52);
+        padding: 10px;
+      }
+
+      .item.selected {
+        background: rgba(245, 245, 247, 0.96);
+      }
+
+      .item-icon {
+        display: grid;
+        width: 34px;
+        height: 34px;
+        place-items: center;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: white;
+        color: var(--blue);
+        font-size: 15px;
+      }
+
+      .item-title {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 13px;
+        font-weight: 650;
+      }
+
+      .item-sub {
+        margin-top: 3px;
+        color: var(--muted);
+        font-size: 11px;
+      }
+
+      .kbd {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: white;
+        color: var(--muted);
+        padding: 5px 7px;
+        font-size: 11px;
+      }
+
+      .section {
+        padding: 72px 0;
+      }
+
+      .section h2 {
+        margin: 0 0 18px;
+        font-size: 32px;
+        line-height: 1.12;
+        letter-spacing: 0;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .card {
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        background: var(--surface-strong);
+        padding: 20px;
+      }
+
+      .card h3 {
+        margin: 0 0 8px;
+        font-size: 16px;
+      }
+
+      .card p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.55;
+      }
+
+      .install {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        gap: 14px;
+      }
+
+      .step {
+        border-left: 3px solid var(--blue);
+        background: var(--surface-strong);
+        border-radius: 14px;
+        padding: 18px;
+      }
+
+      .step strong {
+        display: block;
+        margin-bottom: 8px;
+      }
+
+      .step p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.55;
+      }
+
+      footer {
+        border-top: 1px solid var(--line);
+        padding: 26px 0 34px;
+        color: var(--muted);
+        font-size: 12px;
+        text-align: center;
+      }
+
+      @media (max-width: 820px) {
+        .nav-inner,
+        .section {
+          width: min(100% - 28px, 1040px);
+        }
+
+        .hero {
+          grid-template-columns: 1fr;
+          gap: 34px;
+          padding-top: 44px;
+        }
+
+        .preview {
+          max-width: 430px;
+        }
+
+        .grid,
+        .install {
+          grid-template-columns: 1fr;
+        }
+
+        .nav-actions .hide-mobile {
+          display: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <nav class="nav">
+        <div class="nav-inner">
+          <a class="brand" href="./">
+            <img src="assets/easycopy-icon.png" alt="" />
+            <span>EasyCopy</span>
+          </a>
+          <div class="nav-actions">
+            <a class="hide-mobile" href="#features">功能</a>
+            <a class="hide-mobile" href="#install">安装</a>
+            <a href="downloads/EasyCopy-0.1.0-macOS-arm64.dmg">下载</a>
+          </div>
+        </div>
+      </nav>
+
+      <main>
+        <section class="section hero">
+          <div>
+            <p class="eyebrow">macOS 菜单栏剪贴板工具</p>
+            <h1>EasyCopy</h1>
+            <p class="hero-copy">
+              自动记录文本和图片剪贴板历史，在鼠标附近快速呼出，搜索、选择并粘贴到当前输入框。适合日常开发、写作、运营和频繁复制内容的工作流。
+            </p>
+            <div class="actions">
+              <a class="button primary" href="downloads/EasyCopy-0.1.0-macOS-arm64.dmg">
+                下载 EasyCopy 0.1.0
+              </a>
+              <a class="button" href="https://github.com/trapdope/easy-copy">查看仓库</a>
+            </div>
+            <div class="meta">
+              <span>macOS Apple Silicon</span>
+              <span>DMG 约 3.6 MB</span>
+              <span>默认快捷键 Cmd+Shift+V</span>
+            </div>
+          </div>
+
+          <div class="preview" aria-label="EasyCopy 界面预览">
+            <div class="preview-header">
+              <div class="preview-title">
+                <img src="assets/easycopy-icon.png" alt="" />
+                <div>
+                  <div>EasyCopy</div>
+                  <div class="preview-count">13 / 13</div>
+                </div>
+              </div>
+              <div class="kbd">⌘ ⇧ V</div>
+            </div>
+            <div class="search">搜索剪贴板</div>
+            <div class="items">
+              <div class="item selected">
+                <div class="item-icon">T</div>
+                <div>
+                  <div class="item-title">复制过的文本内容会出现在这里</div>
+                  <div class="item-sub">128 字符 · 来源：Chrome</div>
+                </div>
+                <div class="kbd">↩</div>
+              </div>
+              <div class="item">
+                <div class="item-icon">⌘</div>
+                <div>
+                  <div class="item-title">支持自定义快捷键呼出</div>
+                  <div class="item-sub">32 字符 · 来源：VS Code</div>
+                </div>
+                <div class="kbd">↩</div>
+              </div>
+              <div class="item">
+                <div class="item-icon">▧</div>
+                <div>
+                  <div class="item-title">图片剪贴板也可以被记录</div>
+                  <div class="item-sub">1200x800 · 来源：预览</div>
+                </div>
+                <div class="kbd">↩</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="features" class="section">
+          <h2>轻量，但覆盖高频动作</h2>
+          <div class="grid">
+            <article class="card">
+              <h3>文本和图片历史</h3>
+              <p>自动记录最近 50 条剪贴板内容，支持纯文本和图片，保存在本机。</p>
+            </article>
+            <article class="card">
+              <h3>搜索与快速粘贴</h3>
+              <p>呼出浮窗后可搜索、方向键选择、回车粘贴，也可点击条目直接粘贴。</p>
+            </article>
+            <article class="card">
+              <h3>菜单栏常驻</h3>
+              <p>后台静默运行，不占用 Dock 图标，并支持开机启动和自定义快捷键。</p>
+            </article>
+          </div>
+        </section>
+
+        <section id="install" class="section">
+          <h2>安装方式</h2>
+          <div class="install">
+            <div class="step">
+              <strong>1. 下载 DMG</strong>
+              <p>下载后打开 DMG，将 EasyCopy 拖入 Applications。首次打开如果 macOS 拦截，请右键选择“打开”。</p>
+            </div>
+            <div class="step">
+              <strong>2. 开启辅助功能权限</strong>
+              <p>前往“系统设置 > 隐私与安全性 > 辅助功能”，为 EasyCopy 开启权限，以启用自动粘贴。</p>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <footer>
+        EasyCopy 数据仅保存在本机。当前下载包为 macOS Apple Silicon 版本。
+      </footer>
+    </div>
+  </body>
+</html>
+
