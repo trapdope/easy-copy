@@ -7,9 +7,11 @@ import {
   AlertCircle,
   ClipboardList,
   Command,
-  CornerDownLeft,
   Image as ImageIcon,
   Keyboard,
+  Lock,
+  LockOpen,
+  MessageSquareText,
   MousePointerClick,
   Power,
   Search,
@@ -32,6 +34,8 @@ type ClipboardItem = {
   byteCount: number | null;
   sourceApp: string | null;
   createdAt: number;
+  locked: boolean;
+  note: string | null;
 };
 
 type PasteResult = {
@@ -56,6 +60,10 @@ const isPasting = ref(false);
 const isSettingsOpen = ref(false);
 const isSavingSettings = ref(false);
 const isRecordingShortcut = ref(false);
+const editingNoteItemId = ref<number | null>(null);
+const noteDraft = ref("");
+const isSavingNote = ref(false);
+const noteErrorMessage = ref("");
 const errorMessage = ref("");
 const settingsErrorMessage = ref("");
 const statusMessage = ref(READY_STATUS);
@@ -145,6 +153,14 @@ onBeforeUnmount(() => {
 });
 
 function handleKeydown(event: KeyboardEvent) {
+  if (editingNoteItemId.value !== null) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeNoteEditor();
+    }
+    return;
+  }
+
   if (isRecordingShortcut.value) {
     void handleShortcutRecording(event);
     return;
@@ -425,6 +441,56 @@ async function pasteItem(item: ClipboardItem) {
   }
 }
 
+async function toggleLocked(item: ClipboardItem) {
+  errorMessage.value = "";
+
+  try {
+    await invoke("set_clipboard_item_locked", { id: item.id, locked: !item.locked });
+    setStatus(item.locked ? "已取消锁定" : "已锁定，将长期保留");
+  } catch (error) {
+    errorMessage.value =
+      error instanceof Error ? error.message : String(error || "锁定状态保存失败。");
+  }
+}
+
+function editNote(item: ClipboardItem) {
+  editingNoteItemId.value = item.id;
+  noteDraft.value = item.note || "";
+  noteErrorMessage.value = "";
+}
+
+function closeNoteEditor() {
+  if (isSavingNote.value) {
+    return;
+  }
+  editingNoteItemId.value = null;
+  noteDraft.value = "";
+  noteErrorMessage.value = "";
+}
+
+async function saveNote() {
+  const id = editingNoteItemId.value;
+  if (id === null || isSavingNote.value) {
+    return;
+  }
+
+  isSavingNote.value = true;
+  noteErrorMessage.value = "";
+
+  try {
+    const note = noteDraft.value.trim();
+    await invoke("set_clipboard_item_note", { id, note });
+    editingNoteItemId.value = null;
+    noteDraft.value = "";
+    setStatus(note ? "备注已保存" : "备注已清除");
+  } catch (error) {
+    noteErrorMessage.value =
+      error instanceof Error ? error.message : String(error || "备注保存失败。");
+  } finally {
+    isSavingNote.value = false;
+  }
+}
+
 async function deleteItem(id: number) {
   errorMessage.value = "";
 
@@ -490,12 +556,12 @@ function scrollSelectedIntoView() {
 
 function itemSearchText(item: ClipboardItem) {
   if (item.kind === "text") {
-    return `${item.text || item.preview} ${item.sourceApp || ""}`;
+    return `${item.text || item.preview} ${item.sourceApp || ""} ${item.note || ""}`;
   }
 
   return `${item.preview} ${item.width || ""} ${item.height || ""} ${
     item.sourceApp || ""
-  }`;
+  } ${item.note || ""}`;
 }
 
 function itemPrimaryLabel(item: ClipboardItem) {
@@ -557,7 +623,7 @@ function setStatus(value: string) {
 <template>
   <main class="h-[100dvh] w-screen bg-transparent p-1.5 text-zinc-900">
     <section
-      class="flex h-full flex-col overflow-hidden rounded-xl border border-zinc-300/90 bg-white/[0.9] backdrop-blur-2xl"
+      class="relative flex h-full flex-col overflow-hidden rounded-xl border border-zinc-300/90 bg-white/[0.9] backdrop-blur-2xl"
     >
       <header class="border-b border-white/70 bg-white/45 px-3.5 pb-3 pt-3">
         <div
@@ -784,7 +850,7 @@ function setStatus(value: string) {
               :data-selected="index === selectedIndex"
             >
               <button
-                class="grid min-w-0 grid-cols-[auto_1fr_auto] items-center gap-2.5 px-2.5 py-2 text-left active:scale-[0.995]"
+                class="grid min-w-0 grid-cols-[auto_1fr] items-center gap-2.5 px-2.5 py-2 text-left active:scale-[0.995]"
                 type="button"
                 @pointerdown.prevent.stop="pasteItem(item)"
                 @click.prevent.stop="pasteItem(item)"
@@ -834,36 +900,51 @@ function setStatus(value: string) {
                   >
                     {{ itemSourceLabel(item) }}
                   </span>
+                  <span
+                    v-if="item.note"
+                    class="mt-0.5 block truncate text-[11px] leading-4 text-[#155BD0]"
+                    :title="item.note"
+                  >
+                    备注：{{ item.note }}
+                  </span>
                 </span>
+              </button>
 
-                <span
-                  class="mt-0.5 flex h-6 shrink-0 items-center gap-1 rounded-md border px-1.5 text-[10px]"
-                  :class="
-                    index === selectedIndex
-                      ? 'border-zinc-200 bg-white/80 text-zinc-600'
-                      : 'border-zinc-200 bg-white text-zinc-500'
-                  "
+              <div class="flex shrink-0 items-stretch">
+                <button
+                  class="flex w-7 items-center justify-center transition active:scale-[0.96]"
+                  :class="item.locked ? 'text-[#155BD0]' : 'text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700'"
+                  type="button"
+                  :title="item.locked ? '取消锁定' : '锁定并长期保留'"
+                  :aria-label="item.locked ? '取消锁定记录' : '锁定记录'"
+                  @pointerdown.stop
+                  @click.stop="toggleLocked(item)"
                 >
-                  <Command :size="11" :stroke-width="1.8" />
-                  <CornerDownLeft :size="11" :stroke-width="1.8" />
-                </span>
-              </button>
-
-              <button
-                class="flex w-8 shrink-0 items-center justify-center transition active:scale-[0.96]"
-                :class="
-                  index === selectedIndex
-                    ? 'text-zinc-500 hover:bg-zinc-200/70 hover:text-zinc-800'
-                    : 'text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700'
-                "
-                type="button"
-                title="删除"
-                aria-label="删除记录"
-                @pointerdown.stop
-                @click.stop="deleteItem(item.id)"
-              >
-                <Trash2 :size="14" :stroke-width="1.8" />
-              </button>
+                  <component :is="item.locked ? Lock : LockOpen" :size="14" :stroke-width="1.8" />
+                </button>
+                <button
+                  class="flex w-7 items-center justify-center transition active:scale-[0.96]"
+                  :class="item.note ? 'text-[#155BD0]' : 'text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700'"
+                  type="button"
+                  :title="item.note ? '编辑备注' : '添加备注'"
+                  aria-label="添加或编辑备注"
+                  @pointerdown.stop
+                  @click.stop="editNote(item)"
+                >
+                  <MessageSquareText :size="14" :stroke-width="1.8" />
+                </button>
+                <button
+                  class="flex w-7 items-center justify-center transition active:scale-[0.96]"
+                  :class="index === selectedIndex ? 'text-zinc-500 hover:bg-zinc-200/70 hover:text-zinc-800' : 'text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700'"
+                  type="button"
+                  title="删除"
+                  aria-label="删除记录"
+                  @pointerdown.stop
+                  @click.stop="deleteItem(item.id)"
+                >
+                  <Trash2 :size="14" :stroke-width="1.8" />
+                </button>
+              </div>
             </div>
           </li>
         </ul>
@@ -879,6 +960,62 @@ function setStatus(value: string) {
         <span v-if="isSettingsOpen">{{ appSettings.shortcut }}</span>
         <span v-else>{{ selectedItem ? selectedIndex + 1 : 0 }} / {{ filteredItems.length }}</span>
       </footer>
+
+      <div
+        v-if="editingNoteItemId !== null"
+        class="absolute inset-0 z-30 flex items-center justify-center bg-zinc-900/20 p-5 backdrop-blur-[2px]"
+        @click.self="closeNoteEditor"
+      >
+        <form
+          class="w-full max-w-[320px] rounded-xl border border-zinc-200 bg-white p-4 shadow-xl"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="note-editor-title"
+          @submit.prevent="saveNote"
+        >
+          <div class="mb-3 flex items-center justify-between">
+            <h2 id="note-editor-title" class="text-[13px] font-semibold text-zinc-800">
+              备注这条内容的作用
+            </h2>
+            <button
+              class="flex size-7 items-center justify-center rounded-md text-zinc-500 hover:bg-zinc-100"
+              type="button"
+              aria-label="关闭备注编辑"
+              :disabled="isSavingNote"
+              @click="closeNoteEditor"
+            >
+              <X :size="15" :stroke-width="1.8" />
+            </button>
+          </div>
+          <textarea
+            v-model="noteDraft"
+            class="min-h-24 w-full resize-none rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-[13px] leading-5 text-zinc-800 outline-none transition placeholder:text-zinc-400 focus:border-zinc-400 focus:bg-white"
+            placeholder="例如：公司邮箱签名、常用地址……"
+            maxlength="500"
+            autofocus
+          />
+          <p v-if="noteErrorMessage" class="mt-2 text-[11px] leading-4 text-red-600">
+            {{ noteErrorMessage }}
+          </p>
+          <div class="mt-3 flex justify-end gap-2">
+            <button
+              class="h-8 rounded-md px-3 text-[12px] text-zinc-600 transition hover:bg-zinc-100 disabled:opacity-50"
+              type="button"
+              :disabled="isSavingNote"
+              @click="closeNoteEditor"
+            >
+              取消
+            </button>
+            <button
+              class="h-8 rounded-md bg-zinc-800 px-3 text-[12px] font-medium text-white transition hover:bg-zinc-700 disabled:opacity-50"
+              type="submit"
+              :disabled="isSavingNote"
+            >
+              {{ isSavingNote ? "保存中…" : "保存" }}
+            </button>
+          </div>
+        </form>
+      </div>
     </section>
   </main>
 </template>

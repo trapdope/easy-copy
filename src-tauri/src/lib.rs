@@ -20,7 +20,7 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
-const HISTORY_LIMIT: usize = 50;
+const HISTORY_LIMIT: usize = 100;
 const POLL_INTERVAL_MS: u64 = 650;
 const PASTE_DELAY_MS: u64 = 180;
 const HISTORY_EVENT: &str = "clipboard-history-updated";
@@ -56,6 +56,10 @@ struct ClipboardItem {
     byte_count: Option<usize>,
     source_app: Option<String>,
     created_at: u64,
+    #[serde(default)]
+    locked: bool,
+    #[serde(default)]
+    note: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -201,7 +205,7 @@ struct ClipboardHistoryInner {
 impl ClipboardHistory {
     fn load(file_path: PathBuf) -> Self {
         let mut items = load_history_items(&file_path);
-        items.truncate(HISTORY_LIMIT);
+        trim_history(&mut items);
         let next_id = items.iter().map(|item| item.id).max().unwrap_or(0) + 1;
 
         Self {
@@ -243,6 +247,28 @@ impl ClipboardHistory {
         Some(snapshot)
     }
 
+    fn set_locked(&self, id: u64, locked: bool) -> Option<Vec<ClipboardItem>> {
+        let mut items = self.inner.items.lock().unwrap();
+        let item = items.iter_mut().find(|item| item.id == id)?;
+        item.locked = locked;
+        trim_history(&mut items);
+        let snapshot = items.clone();
+        drop(items);
+        self.persist(&snapshot);
+        Some(snapshot)
+    }
+
+    fn set_note(&self, id: u64, note: String) -> Option<Vec<ClipboardItem>> {
+        let mut items = self.inner.items.lock().unwrap();
+        let item = items.iter_mut().find(|item| item.id == id)?;
+        let note = note.trim();
+        item.note = (!note.is_empty()).then(|| note.to_string());
+        let snapshot = items.clone();
+        drop(items);
+        self.persist(&snapshot);
+        Some(snapshot)
+    }
+
     fn push_payload(
         &self,
         payload: ClipboardPayload,
@@ -272,16 +298,24 @@ impl ClipboardHistory {
             return None;
         }
 
-        items.retain(|item| !item_matches_payload(item, &payload));
-
-        let item = clipboard_item_from_payload(
-            self.inner.next_id.fetch_add(1, Ordering::Relaxed),
-            payload,
-            effective_source_app,
-        );
+        let existing_index = items.iter().position(|item| item_matches_payload(item, &payload));
+        let item = if let Some(index) = existing_index {
+            let mut item = items.remove(index);
+            if effective_source_app.is_some() {
+                item.source_app = effective_source_app;
+            }
+            item.created_at = now_millis();
+            item
+        } else {
+            clipboard_item_from_payload(
+                self.inner.next_id.fetch_add(1, Ordering::Relaxed),
+                payload,
+                effective_source_app,
+            )
+        };
 
         items.insert(0, item);
-        items.truncate(HISTORY_LIMIT);
+        trim_history(&mut items);
 
         let snapshot = items.clone();
         drop(items);
@@ -390,6 +424,34 @@ fn delete_clipboard_item(
 }
 
 #[tauri::command]
+fn set_clipboard_item_locked(
+    app: AppHandle,
+    history: State<'_, ClipboardHistory>,
+    id: u64,
+    locked: bool,
+) -> Result<(), String> {
+    let snapshot = history
+        .set_locked(id, locked)
+        .ok_or_else(|| "Clipboard item no longer exists.".to_string())?;
+    app.emit(HISTORY_EVENT, snapshot)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn set_clipboard_item_note(
+    app: AppHandle,
+    history: State<'_, ClipboardHistory>,
+    id: u64,
+    note: String,
+) -> Result<(), String> {
+    let snapshot = history
+        .set_note(id, note)
+        .ok_or_else(|| "Clipboard item no longer exists.".to_string())?;
+    app.emit(HISTORY_EVENT, snapshot)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn paste_clipboard_item(
     app: AppHandle,
     history: State<'_, ClipboardHistory>,
@@ -476,6 +538,8 @@ pub fn run() {
             show_palette,
             hide_palette,
             delete_clipboard_item,
+            set_clipboard_item_locked,
+            set_clipboard_item_note,
             paste_clipboard_item,
             open_accessibility_settings
         ])
@@ -777,6 +841,22 @@ fn clamp_f64(value: f64, min: f64, max: f64) -> f64 {
     value.max(min).min(max)
 }
 
+fn trim_history(items: &mut Vec<ClipboardItem>) {
+    let locked_count = items.iter().filter(|item| item.locked).count();
+    let unlocked_limit = HISTORY_LIMIT.saturating_sub(locked_count);
+    let mut unlocked_kept = 0;
+    items.retain(|item| {
+        if item.locked {
+            true
+        } else if unlocked_kept < unlocked_limit {
+            unlocked_kept += 1;
+            true
+        } else {
+            false
+        }
+    });
+}
+
 fn load_history_items(file_path: &PathBuf) -> Vec<ClipboardItem> {
     let Some(content) = fs::read_to_string(file_path).ok() else {
         return Vec::new();
@@ -802,6 +882,8 @@ fn load_history_items(file_path: &PathBuf) -> Vec<ClipboardItem> {
                     byte_count: None,
                     source_app: None,
                     created_at: item.created_at,
+                    locked: false,
+                    note: None,
                 })
                 .collect()
         })
@@ -1004,6 +1086,7 @@ fn is_launch_at_login_enabled() -> bool {
 #[cfg(target_os = "macos")]
 fn set_launch_at_login_enabled(enabled: bool) -> Result<(), String> {
     let path = launch_agent_path().ok_or_else(|| "无法定位 LaunchAgents 目录。".to_string())?;
+    let domain = launch_agent_domain()?;
 
     if enabled {
         let executable = env::current_exe().map_err(|error| error.to_string())?;
@@ -1013,14 +1096,58 @@ fn set_launch_at_login_enabled(enabled: bool) -> Result<(), String> {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
 
-        fs::write(path, content).map_err(|error| error.to_string())
+        fs::write(&path, content).map_err(|error| error.to_string())?;
+
+        // Replace an already loaded job so the new executable path takes effect now.
+        let _ = Command::new("/bin/launchctl")
+            .arg("bootout")
+            .arg(&domain)
+            .arg(&path)
+            .output();
+
+        let output = Command::new("/bin/launchctl")
+            .arg("bootstrap")
+            .arg(&domain)
+            .arg(&path)
+            .output()
+            .map_err(|error| format!("无法加载开机启动项：{error}"))?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "无法加载开机启动项：{}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
     } else {
+        let _ = Command::new("/bin/launchctl")
+            .arg("bootout")
+            .arg(&domain)
+            .arg(&path)
+            .output();
+
         if path.exists() {
             fs::remove_file(path).map_err(|error| error.to_string())?;
         }
 
         Ok(())
     }
+}
+
+#[cfg(target_os = "macos")]
+fn launch_agent_domain() -> Result<String, String> {
+    let output = Command::new("/usr/bin/id")
+        .arg("-u")
+        .output()
+        .map_err(|error| format!("无法读取当前用户 ID：{error}"))?;
+
+    if !output.status.success() {
+        return Err("无法读取当前用户 ID。".to_string());
+    }
+
+    let uid = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
+    Ok(format!("gui/{}", uid.trim()))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1133,6 +1260,8 @@ fn clipboard_item_from_payload(
             byte_count: None,
             source_app,
             created_at: now_millis(),
+            locked: false,
+            note: None,
         },
         ClipboardPayload::Image {
             image_data_url,
@@ -1151,6 +1280,8 @@ fn clipboard_item_from_payload(
             byte_count: Some(byte_count),
             source_app,
             created_at: now_millis(),
+            locked: false,
+            note: None,
         },
     }
 }
