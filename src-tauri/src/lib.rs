@@ -1075,7 +1075,16 @@ fn unregister_palette_shortcut(app: &AppHandle, shortcut: &str) {
 
 #[cfg(target_os = "macos")]
 fn is_launch_at_login_enabled() -> bool {
-    launch_agent_path().is_some_and(|path| path.exists())
+    let Some(path) = launch_agent_path() else {
+        return false;
+    };
+
+    let Ok(content) = fs::read_to_string(path) else {
+        return false;
+    };
+
+    let executable = launch_agent_executable();
+    content.contains(executable.to_string_lossy().as_ref())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1089,7 +1098,7 @@ fn set_launch_at_login_enabled(enabled: bool) -> Result<(), String> {
     let domain = launch_agent_domain()?;
 
     if enabled {
-        let executable = env::current_exe().map_err(|error| error.to_string())?;
+        let executable = launch_agent_executable();
         let content = launch_agent_plist(&executable.to_string_lossy());
 
         if let Some(parent) = path.parent() {
@@ -1132,6 +1141,16 @@ fn set_launch_at_login_enabled(enabled: bool) -> Result<(), String> {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn launch_agent_executable() -> PathBuf {
+    let installed = PathBuf::from("/Applications/EasyCopy.app/Contents/MacOS/easy-copy");
+    if installed.exists() {
+        installed
+    } else {
+        env::current_exe().unwrap_or_else(|_| installed)
     }
 }
 
