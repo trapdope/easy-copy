@@ -16,20 +16,19 @@ use std::{
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, LogicalPosition, Manager, PhysicalPosition, State, WindowEvent,
+    AppHandle, Emitter, Manager, PhysicalPosition, State, WindowEvent,
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 const HISTORY_LIMIT: usize = 100;
 const POLL_INTERVAL_MS: u64 = 650;
 const PASTE_DELAY_MS: u64 = 180;
+const PASTE_RESTORE_DELAY_MS: u64 = 140;
 const HISTORY_EVENT: &str = "clipboard-history-updated";
 const PALETTE_OPENED_EVENT: &str = "palette-opened";
 const SETTINGS_EVENT: &str = "app-settings-updated";
 const SETTINGS_OPENED_EVENT: &str = "settings-opened";
 const PNG_DATA_URL_PREFIX: &str = "data:image/png;base64,";
-const PALETTE_WIDTH: f64 = 380.0;
-const PALETTE_HEIGHT: f64 = 500.0;
 const PALETTE_MARGIN: f64 = 12.0;
 const PALETTE_CURSOR_GAP: f64 = 12.0;
 const DEFAULT_SHORTCUT: &str = "Cmd+Shift+V";
@@ -475,6 +474,7 @@ fn paste_clipboard_item(
         return Ok(PasteResult { pasted: false });
     }
 
+    thread::sleep(Duration::from_millis(PASTE_RESTORE_DELAY_MS));
     paste_into_focus_target(&target)?;
 
     Ok(PasteResult { pasted: true })
@@ -549,6 +549,10 @@ pub fn run() {
 
 fn setup_palette_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_always_on_top(true);
+        let _ = window.set_visible_on_all_workspaces(true);
+        configure_palette_window_for_fullscreen(&window);
+
         let window_for_events = window.clone();
         window.on_window_event(move |event| match event {
             WindowEvent::CloseRequested { api, .. } => {
@@ -671,9 +675,10 @@ fn show_palette_window(app: &AppHandle) -> tauri::Result<()> {
     }
 
     if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_always_on_top(true);
+        let _ = window.set_visible_on_all_workspaces(true);
         place_palette_near_cursor(app, &window);
         window.show()?;
-        place_palette_near_cursor(app, &window);
         window.set_focus()?;
         let _ = focus_palette_with_system_events();
         let _ = window.emit(PALETTE_OPENED_EVENT, ());
@@ -729,65 +734,27 @@ fn focus_palette_with_system_events() -> bool {
 }
 
 fn place_palette_near_cursor(app: &AppHandle, window: &tauri::WebviewWindow) {
-    if place_palette_near_cursor_with_macos_events(window) {
-        return;
-    }
-
     place_palette_near_cursor_with_tauri(app, window);
 }
 
 #[cfg(target_os = "macos")]
-fn place_palette_near_cursor_with_macos_events(window: &tauri::WebviewWindow) -> bool {
-    use core_graphics::{
-        display::CGDisplay,
-        event::CGEvent,
-        event_source::{CGEventSource, CGEventSourceStateID},
+fn configure_palette_window_for_fullscreen(window: &tauri::WebviewWindow) {
+    use objc2_app_kit::{NSWindow, NSWindowCollectionBehavior};
+
+    let Ok(native_window) = window.ns_window() else {
+        return;
+    };
+    let Some(native_window) = (unsafe { native_window.cast::<NSWindow>().as_ref() }) else {
+        return;
     };
 
-    let source = match CGEventSource::new(CGEventSourceStateID::HIDSystemState) {
-        Ok(source) => source,
-        Err(_) => return false,
-    };
-    let event = match CGEvent::new(source) {
-        Ok(event) => event,
-        Err(_) => return false,
-    };
-    let cursor = event.location();
-    let display_id = match CGDisplay::displays_with_point(cursor, 1)
-        .ok()
-        .and_then(|(displays, _)| displays.into_iter().next())
-    {
-        Some(display_id) => display_id,
-        None => return false,
-    };
-    let bounds = CGDisplay::new(display_id).bounds();
-    let min_x = bounds.origin.x + PALETTE_MARGIN;
-    let min_y = bounds.origin.y + PALETTE_MARGIN;
-    let max_x = bounds.origin.x + bounds.size.width - PALETTE_WIDTH - PALETTE_MARGIN;
-    let max_y = bounds.origin.y + bounds.size.height - PALETTE_HEIGHT - PALETTE_MARGIN;
-    let has_right_space = cursor.x + PALETTE_CURSOR_GAP <= max_x;
-    let has_bottom_space = cursor.y + PALETTE_CURSOR_GAP <= max_y;
-    let preferred_x = if has_right_space {
-        cursor.x + PALETTE_CURSOR_GAP
-    } else {
-        cursor.x - PALETTE_WIDTH - PALETTE_CURSOR_GAP
-    };
-    let preferred_y = if has_bottom_space {
-        cursor.y + PALETTE_CURSOR_GAP
-    } else {
-        cursor.y - PALETTE_HEIGHT - PALETTE_CURSOR_GAP
-    };
-    let x = clamp_f64(preferred_x, min_x, max_x).round() as i32;
-    let y = clamp_f64(preferred_y, min_y, max_y).round() as i32;
-
-    window
-        .set_position(LogicalPosition::new(f64::from(x), f64::from(y)))
-        .is_ok()
+    let behavior = native_window.collectionBehavior()
+        | NSWindowCollectionBehavior::FullScreenAuxiliary;
+    native_window.setCollectionBehavior(behavior);
 }
 
 #[cfg(not(target_os = "macos"))]
-fn place_palette_near_cursor_with_macos_events(_window: &tauri::WebviewWindow) -> bool {
-    false
+fn configure_palette_window_for_fullscreen(_window: &tauri::WebviewWindow) {
 }
 
 fn place_palette_near_cursor_with_tauri(app: &AppHandle, window: &tauri::WebviewWindow) {
@@ -808,32 +775,40 @@ fn place_palette_near_cursor_with_tauri(app: &AppHandle, window: &tauri::Webview
 
     let monitor_pos = monitor.position();
     let monitor_size = monitor.size();
-    let margin = 12;
+    let scale_factor = monitor.scale_factor();
+    let margin = (PALETTE_MARGIN * scale_factor).round() as i32;
+    let gap = (PALETTE_CURSOR_GAP * scale_factor).round() as i32;
+    let window_width = window_size.width as i32;
+    let window_height = window_size.height as i32;
+    let monitor_width = monitor_size.width as i32;
+    let monitor_height = monitor_size.height as i32;
 
     let min_x = monitor_pos.x + margin;
     let min_y = monitor_pos.y + margin;
-    let max_x = monitor_pos.x + monitor_size.width as i32 - window_size.width as i32 - margin;
-    let max_y = monitor_pos.y + monitor_size.height as i32 - window_size.height as i32 - margin;
+    let max_x = monitor_pos.x + monitor_width - window_width - margin;
+    let max_y = monitor_pos.y + monitor_height - window_height - margin;
+    let cursor_x = cursor.x.round() as i32;
+    let cursor_y = cursor.y.round() as i32;
+    let right_x = cursor_x + gap;
+    let below_y = cursor_y + gap;
+    let preferred_x = if right_x <= max_x {
+        right_x
+    } else {
+        cursor_x - window_width - gap
+    };
+    let preferred_y = if below_y <= max_y {
+        below_y
+    } else {
+        cursor_y - window_height - gap
+    };
 
-    let x = clamp_i32(
-        cursor.x.round() as i32 - window_size.width as i32 / 2,
-        min_x,
-        max_x,
-    );
-    let y = clamp_i32(cursor.y.round() as i32 + 18, min_y, max_y);
+    let x = clamp_i32(preferred_x, min_x, max_x);
+    let y = clamp_i32(preferred_y, min_y, max_y);
 
     let _ = window.set_position(PhysicalPosition { x, y });
 }
 
 fn clamp_i32(value: i32, min: i32, max: i32) -> i32 {
-    if min > max {
-        return min;
-    }
-
-    value.max(min).min(max)
-}
-
-fn clamp_f64(value: f64, min: f64, max: f64) -> f64 {
     if min > max {
         return min;
     }
@@ -1504,7 +1479,7 @@ fn paste_into_focus_target(target: &FocusTarget) -> Result<(), String> {
 tell application "System Events"
   if exists process "{}" then
     set frontmost of process "{}" to true
-    delay 0.08
+    delay 0.14
     keystroke "v" using command down
     return "ok"
   end if

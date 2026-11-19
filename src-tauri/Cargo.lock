@@ -884,6 +884,7 @@ dependencies = [
  "base64 0.22.1",
  "core-graphics",
  "image",
+ "objc2-app-kit",
  "serde",
  "serde_json",
  "tauri",
