@@ -20,6 +20,17 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
+#[cfg(target_os = "macos")]
+tauri_nspanel::tauri_panel! {
+    panel!(EasyCopyPanel {
+        config: {
+            can_become_key_window: true,
+            can_become_main_window: false,
+            is_floating_panel: true
+        }
+    })
+}
+
 const HISTORY_LIMIT: usize = 100;
 const POLL_INTERVAL_MS: u64 = 650;
 const PASTE_ACTIVATE_TIMEOUT_MS: u64 = 140;
@@ -592,6 +603,7 @@ fn repair_accessibility_permission() -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_nspanel::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {
@@ -616,7 +628,7 @@ pub fn run() {
             app.manage(settings);
             app.manage(ShortcutRegistration::new(registered_shortcut));
 
-            setup_palette_window(app.handle());
+            setup_palette_window(app.handle())?;
             setup_tray(app.handle())?;
 
             spawn_clipboard_watcher(app_handle, history);
@@ -641,14 +653,28 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-fn setup_palette_window(app: &AppHandle) {
+fn setup_palette_window(app: &AppHandle) -> tauri::Result<()> {
     if let Some(window) = app.get_webview_window("main") {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = window.set_always_on_top(true);
             let _ = window.set_visible_on_all_workspaces(true);
         }
-        configure_palette_window_for_fullscreen(&window);
+        #[cfg(target_os = "macos")]
+        {
+            use tauri_nspanel::{CollectionBehavior, PanelLevel, StyleMask, WebviewWindowExt};
+
+            let panel = window.to_panel::<EasyCopyPanel>()?;
+            panel.set_level(PanelLevel::Floating.value());
+            let _ = panel.add_style_mask(StyleMask::empty().nonactivating_panel().into());
+            panel.set_collection_behavior(
+                CollectionBehavior::new()
+                    .can_join_all_spaces()
+                    .full_screen_auxiliary()
+                    .into(),
+            );
+            panel.set_hides_on_deactivate(false);
+        }
 
         let app_for_events = app.clone();
         window.on_window_event(move |event| match event {
@@ -664,6 +690,8 @@ fn setup_palette_window(app: &AppHandle) {
             _ => {}
         });
     }
+
+    Ok(())
 }
 
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
@@ -813,9 +841,8 @@ fn show_palette_window(app: &AppHandle) -> tauri::Result<()> {
                 let _ = window.set_always_on_top(true);
                 let _ = window.set_visible_on_all_workspaces(true);
             }
-            configure_palette_window_for_fullscreen(&window);
             place_palette_near_cursor(&app_for_main, &window);
-            show_palette_interactively(&window)?;
+            show_palette_interactively(&app_for_main, &window)?;
             let _ = window.emit(PALETTE_OPENED_EVENT, ());
         }
         Ok(())
@@ -890,53 +917,28 @@ fn show_settings_window(app: &AppHandle) -> tauri::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn show_palette_interactively(window: &tauri::WebviewWindow) -> tauri::Result<()> {
-    use objc2_app_kit::{NSApplication, NSWindow};
-    use objc2_foundation::MainThreadMarker;
+fn show_palette_interactively(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+) -> tauri::Result<()> {
+    use tauri_nspanel::ManagerExt;
 
-    let native_window = window.ns_window()?;
-    let Some(native_window) = (unsafe { native_window.cast::<NSWindow>().as_ref() }) else {
-        return Ok(());
-    };
-
-    let Some(main_thread) = MainThreadMarker::new() else {
-        return Ok(());
-    };
-    NSApplication::sharedApplication(main_thread).activateIgnoringOtherApps(true);
-    native_window.makeKeyAndOrderFront(None);
+    if let Ok(panel) = app.get_webview_panel(window.label()) {
+        panel.show_and_make_key();
+    }
     Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
-fn show_palette_interactively(window: &tauri::WebviewWindow) -> tauri::Result<()> {
+fn show_palette_interactively(
+    _app: &AppHandle,
+    window: &tauri::WebviewWindow,
+) -> tauri::Result<()> {
     window.show()
 }
 
 fn place_palette_near_cursor(app: &AppHandle, window: &tauri::WebviewWindow) {
     place_palette_near_cursor_with_tauri(app, window);
-}
-
-#[cfg(target_os = "macos")]
-fn configure_palette_window_for_fullscreen(window: &tauri::WebviewWindow) {
-    use objc2_app_kit::{NSWindow, NSWindowCollectionBehavior, NSStatusWindowLevel};
-
-    let Ok(native_window) = window.ns_window() else {
-        return;
-    };
-    let Some(native_window) = (unsafe { native_window.cast::<NSWindow>().as_ref() }) else {
-        return;
-    };
-
-    let behavior = native_window.collectionBehavior()
-        | NSWindowCollectionBehavior::CanJoinAllSpaces
-        | NSWindowCollectionBehavior::FullScreenAuxiliary;
-    native_window.setCollectionBehavior(behavior);
-    native_window.setLevel(NSStatusWindowLevel);
-    native_window.setHidesOnDeactivate(false);
-}
-
-#[cfg(not(target_os = "macos"))]
-fn configure_palette_window_for_fullscreen(_window: &tauri::WebviewWindow) {
 }
 
 #[cfg(target_os = "macos")]

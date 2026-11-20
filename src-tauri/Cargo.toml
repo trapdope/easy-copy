@@ -1,6 +1,6 @@
 [package]
 name = "easy-copy"
-version = "0.1.3"
+version = "0.1.4"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -21,6 +21,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-global-shortcut = "2"
+tauri-nspanel = "2.1.1"
 arboard = "3.6"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png"] }
