@@ -5,7 +5,7 @@ EasyCopy 是一款 macOS 剪贴板历史管理工具。它常驻菜单栏，自�
 ## 官网与下载
 
 - 官网：<https://trapdope.github.io/easy-copy/>
-- macOS Apple Silicon 下载包：[`docs/downloads/EasyCopy-0.1.1-macOS-arm64.dmg`](docs/downloads/EasyCopy-0.1.1-macOS-arm64.dmg)
+- macOS Apple Silicon 下载包：[`docs/downloads/EasyCopy-0.1.2-macOS-arm64.dmg`](docs/downloads/EasyCopy-0.1.2-macOS-arm64.dmg)
 
 ## 功能特性
 
@@ -32,7 +32,7 @@ EasyCopy 的自动粘贴能力需要 macOS 辅助功能权限。
 系统设置 > 隐私与安全性 > 辅助功能
 ```
 
-然后为 `EasyCopy` 开启权限。
+然后为 `EasyCopy` 开启权限。正式安装版本使用固定的应用签名标识，常规更新后一般不需要重复授权。
 
 如果未开启辅助功能权限，EasyCopy 仍然可以记录和复制剪贴板内容，但无法稳定地把选中内容自动粘贴到目标应用。
 
@@ -105,10 +105,10 @@ pnpm tauri dev
 pnpm build
 ```
 
-构建 macOS 应用：
+构建 macOS 应用和官网 DMG：
 
 ```bash
-pnpm tauri build
+pnpm run build:mac
 ```
 
 ## 技术栈

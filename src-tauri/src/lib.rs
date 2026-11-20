@@ -16,14 +16,16 @@ use std::{
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, PhysicalPosition, State, WindowEvent,
+    AppHandle, Emitter, Manager, State, WindowEvent,
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 const HISTORY_LIMIT: usize = 100;
 const POLL_INTERVAL_MS: u64 = 650;
-const PASTE_DELAY_MS: u64 = 180;
-const PASTE_RESTORE_DELAY_MS: u64 = 140;
+const PASTE_ACTIVATE_TIMEOUT_MS: u64 = 140;
+const PASTE_SETTLE_DELAY_MS: u64 = 45;
+const FOCUS_LOSS_GRACE_MS: u64 = 200;
+const SELF_CLIPBOARD_WRITE_GRACE_MS: u64 = 1500;
 const HISTORY_EVENT: &str = "clipboard-history-updated";
 const PALETTE_OPENED_EVENT: &str = "palette-opened";
 const SETTINGS_EVENT: &str = "app-settings-updated";
@@ -33,6 +35,8 @@ const PALETTE_MARGIN: f64 = 12.0;
 const PALETTE_CURSOR_GAP: f64 = 12.0;
 const DEFAULT_SHORTCUT: &str = "Cmd+Shift+V";
 const LAUNCH_AGENT_LABEL: &str = "com.blue.easycopy";
+
+static LAST_PALETTE_SHOWN_AT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -84,14 +88,15 @@ enum ClipboardPayload {
 
 #[derive(Debug, Clone, Default)]
 struct FocusTarget {
+    pid: i32,
     process_name: String,
-    is_editable: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PasteResult {
     pasted: bool,
+    needs_accessibility: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,6 +204,7 @@ struct ClipboardHistoryInner {
     next_id: AtomicU64,
     file_path: PathBuf,
     focus_target: Mutex<Option<FocusTarget>>,
+    ignore_source_app_until: AtomicU64,
 }
 
 impl ClipboardHistory {
@@ -213,6 +219,7 @@ impl ClipboardHistory {
                 next_id: AtomicU64::new(next_id),
                 file_path,
                 focus_target: Mutex::new(None),
+                ignore_source_app_until: AtomicU64::new(0),
             }),
         }
     }
@@ -229,6 +236,35 @@ impl ClipboardHistory {
             .iter()
             .find(|item| item.id == id)
             .cloned()
+    }
+
+    fn mark_self_clipboard_write(&self) {
+        self.inner.ignore_source_app_until.store(
+            now_millis().saturating_add(SELF_CLIPBOARD_WRITE_GRACE_MS),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn is_self_clipboard_write_active(&self) -> bool {
+        now_millis() <= self.inner.ignore_source_app_until.load(Ordering::Relaxed)
+    }
+
+    fn promote(&self, id: u64) -> Option<Vec<ClipboardItem>> {
+        let mut items = self.inner.items.lock().unwrap();
+        let index = items.iter().position(|item| item.id == id)?;
+
+        if index == 0 {
+            return None;
+        }
+
+        let mut item = items.remove(index);
+        item.created_at = now_millis();
+        items.insert(0, item);
+
+        let snapshot = items.clone();
+        drop(items);
+        self.persist(&snapshot);
+        Some(snapshot)
     }
 
     fn delete(&self, id: u64) -> Option<Vec<ClipboardItem>> {
@@ -278,14 +314,18 @@ impl ClipboardHistory {
             .iter()
             .find(|item| item_matches_payload(item, &payload))
             .and_then(|item| item.source_app.clone());
-        let effective_source_app = source_app.or(existing_source_app);
+        let effective_source_app = if self.is_self_clipboard_write_active() {
+            existing_source_app
+        } else {
+            source_app.or(existing_source_app)
+        };
 
         if items
             .first()
             .is_some_and(|item| item_matches_payload(item, &payload))
         {
-            if let Some(source_app) = effective_source_app {
-                if items[0].source_app.as_deref() != Some(source_app.as_str()) {
+            if items[0].source_app.is_none() {
+                if let Some(source_app) = effective_source_app {
                     items[0].source_app = Some(source_app);
                     let snapshot = items.clone();
                     drop(items);
@@ -401,11 +441,7 @@ fn show_palette(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn hide_palette(app: AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("main") {
-        window.hide().map_err(|error| error.to_string())?;
-    }
-
-    Ok(())
+    hide_palette_window(&app).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -450,7 +486,7 @@ fn set_clipboard_item_note(
         .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn paste_clipboard_item(
     app: AppHandle,
     history: State<'_, ClipboardHistory>,
@@ -458,32 +494,60 @@ fn paste_clipboard_item(
 ) -> Result<PasteResult, String> {
     let item = history
         .find(id)
-        .ok_or_else(|| "Clipboard item no longer exists.".to_string())?;
+        .ok_or_else(|| "剪贴板记录已不存在。".to_string())?;
 
+    history.mark_self_clipboard_write();
     write_clipboard_item(&item)?;
 
-    if let Some(window) = app.get_webview_window("main") {
-        window.hide().map_err(|error| error.to_string())?;
+    if let Some(snapshot) = history.promote(id) {
+        let _ = app.emit(HISTORY_EVENT, snapshot);
     }
 
-    let Some(target) = history.focus_target() else {
-        return Ok(PasteResult { pasted: false });
-    };
-
-    if !target.is_editable {
-        return Ok(PasteResult { pasted: false });
+    if !is_accessibility_trusted() {
+        let _ = prompt_accessibility_permission();
+        return Ok(PasteResult {
+            pasted: false,
+            needs_accessibility: true,
+        });
     }
 
-    thread::sleep(Duration::from_millis(PASTE_RESTORE_DELAY_MS));
-    paste_into_focus_target(&target)?;
+    let target = history.focus_target().or_else(capture_focus_target);
 
-    Ok(PasteResult { pasted: true })
+    hide_palette_and_activate_target(&app, target.as_ref())
+        .map_err(|error| error.to_string())?;
+
+    if let Some(target) = target.as_ref() {
+        wait_for_target_frontmost(target, PASTE_ACTIVATE_TIMEOUT_MS);
+    }
+    thread::sleep(Duration::from_millis(PASTE_SETTLE_DELAY_MS));
+
+    paste_into_focus_target(target.as_ref())?;
+
+    Ok(PasteResult {
+        pasted: true,
+        needs_accessibility: false,
+    })
+}
+
+#[tauri::command]
+fn check_accessibility_permission() -> bool {
+    is_accessibility_trusted()
+}
+
+#[tauri::command]
+fn request_accessibility_permission() -> Result<bool, String> {
+    let trusted = prompt_accessibility_permission();
+    if !trusted {
+        let _ = open_accessibility_settings();
+    }
+    Ok(trusted)
 }
 
 #[tauri::command]
 fn open_accessibility_settings() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
+        let _ = prompt_accessibility_permission();
         Command::new("open")
             .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
             .spawn()
@@ -541,6 +605,8 @@ pub fn run() {
             set_clipboard_item_locked,
             set_clipboard_item_note,
             paste_clipboard_item,
+            check_accessibility_permission,
+            request_accessibility_permission,
             open_accessibility_settings
         ])
         .run(tauri::generate_context!())
@@ -549,17 +615,23 @@ pub fn run() {
 
 fn setup_palette_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.set_always_on_top(true);
-        let _ = window.set_visible_on_all_workspaces(true);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = window.set_always_on_top(true);
+            let _ = window.set_visible_on_all_workspaces(true);
+        }
         configure_palette_window_for_fullscreen(&window);
 
-        let window_for_events = window.clone();
+        let app_for_events = app.clone();
         window.on_window_event(move |event| match event {
             WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
             }
             WindowEvent::Focused(false) => {
-                let _ = window_for_events.hide();
+                let shown_at = LAST_PALETTE_SHOWN_AT.load(Ordering::Relaxed);
+                if now_millis().saturating_sub(shown_at) > FOCUS_LOSS_GRACE_MS {
+                    let _ = hide_palette_window(&app_for_events);
+                }
             }
             _ => {}
         });
@@ -620,6 +692,12 @@ fn spawn_clipboard_watcher(app: AppHandle, history: ClipboardHistory) {
         let mut last_text = String::new();
 
         loop {
+            if !is_palette_window_visible(&app) {
+                if let Some(target) = capture_focus_target() {
+                    history.set_focus_target(Some(target));
+                }
+            }
+
             if let Ok(image) = clipboard.get_image() {
                 let width = image.width;
                 let height = image.height;
@@ -667,31 +745,107 @@ fn emit_history_if_changed(
     }
 }
 
+fn is_palette_window_visible(app: &AppHandle) -> bool {
+    app.get_webview_window("main")
+        .and_then(|window| window.is_visible().ok())
+        .unwrap_or(false)
+}
+
+fn run_on_main_thread_sync<F, R>(app: &AppHandle, f: F) -> tauri::Result<R>
+where
+    F: FnOnce() -> tauri::Result<R> + Send + 'static,
+    R: Send + 'static,
+{
+    #[cfg(target_os = "macos")]
+    if objc2_foundation::MainThreadMarker::new().is_some() {
+        return f();
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.run_on_main_thread(move || {
+        let _ = tx.send(f());
+    })?;
+    rx.recv()
+        .map_err(|_| tauri::Error::FailedToReceiveMessage)?
+}
+
 fn show_palette_window(app: &AppHandle) -> tauri::Result<()> {
-    let focus_target = capture_focus_target();
-
-    if let Some(history) = app.try_state::<ClipboardHistory>() {
-        history.set_focus_target(focus_target.clone());
+    if let Some(focus_target) = capture_focus_target() {
+        if let Some(history) = app.try_state::<ClipboardHistory>() {
+            history.set_focus_target(Some(focus_target));
+        }
     }
 
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.set_always_on_top(true);
-        let _ = window.set_visible_on_all_workspaces(true);
-        place_palette_near_cursor(app, &window);
-        window.show()?;
-        window.set_focus()?;
-        let _ = focus_palette_with_system_events();
-        let _ = window.emit(PALETTE_OPENED_EVENT, ());
-    }
+    let app_for_main = app.clone();
+    run_on_main_thread_sync(app, move || {
+        if let Some(window) = app_for_main.get_webview_window("main") {
+            LAST_PALETTE_SHOWN_AT.store(now_millis(), Ordering::Relaxed);
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = window.set_always_on_top(true);
+                let _ = window.set_visible_on_all_workspaces(true);
+            }
+            configure_palette_window_for_fullscreen(&window);
+            place_palette_near_cursor(&app_for_main, &window);
+            show_palette_interactively(&window)?;
+            let _ = window.emit(PALETTE_OPENED_EVENT, ());
+        }
+        Ok(())
+    })
+}
 
-    Ok(())
+fn hide_palette_window(app: &AppHandle) -> tauri::Result<()> {
+    let app_for_main = app.clone();
+    run_on_main_thread_sync(app, move || {
+        if let Some(window) = app_for_main.get_webview_window("main") {
+            #[cfg(target_os = "macos")]
+            {
+                use objc2_app_kit::NSWindow;
+                if let Ok(raw_window) = window.ns_window() {
+                    if let Some(native_window) = unsafe { raw_window.cast::<NSWindow>().as_ref() } {
+                        native_window.orderOut(None);
+                        return Ok(());
+                    }
+                }
+            }
+            window.hide()?;
+        }
+        Ok(())
+    })
+}
+
+fn hide_palette_and_activate_target(
+    app: &AppHandle,
+    target: Option<&FocusTarget>,
+) -> tauri::Result<()> {
+    let app_for_main = app.clone();
+    let target_cloned = target.cloned();
+    run_on_main_thread_sync(app, move || {
+        if let Some(window) = app_for_main.get_webview_window("main") {
+            #[cfg(target_os = "macos")]
+            {
+                use objc2_app_kit::NSWindow;
+                if let Ok(raw_window) = window.ns_window() {
+                    if let Some(native_window) = unsafe { raw_window.cast::<NSWindow>().as_ref() } {
+                        native_window.orderOut(None);
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                window.hide()?;
+            }
+        }
+        if let Some(target) = target_cloned.as_ref() {
+            activate_focus_target(target);
+        }
+        Ok(())
+    })
 }
 
 fn show_palette_window_from_shortcut(app: &AppHandle) -> tauri::Result<()> {
-    if let Some(window) = app.get_webview_window("main") {
-        if window.is_visible().unwrap_or(false) {
-            return Ok(());
-        }
+    if is_palette_window_visible(app) {
+        return hide_palette_window(app);
     }
 
     show_palette_window(app)
@@ -708,29 +862,26 @@ fn show_settings_window(app: &AppHandle) -> tauri::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn focus_palette_with_system_events() -> bool {
-    let script = r#"
-tell application "System Events"
-  if exists process "EasyCopy" then
-    set frontmost of process "EasyCopy" to true
-    return "ok"
-  end if
-  if exists process "easy-copy" then
-    set frontmost of process "easy-copy" to true
-    return "ok"
-  end if
-end tell
-return "missing"
-"#;
+fn show_palette_interactively(window: &tauri::WebviewWindow) -> tauri::Result<()> {
+    use objc2_app_kit::{NSApplication, NSWindow};
+    use objc2_foundation::MainThreadMarker;
 
-    run_osascript(script)
-        .map(|output| output.trim() == "ok")
-        .unwrap_or(false)
+    let native_window = window.ns_window()?;
+    let Some(native_window) = (unsafe { native_window.cast::<NSWindow>().as_ref() }) else {
+        return Ok(());
+    };
+
+    let Some(main_thread) = MainThreadMarker::new() else {
+        return Ok(());
+    };
+    NSApplication::sharedApplication(main_thread).activateIgnoringOtherApps(true);
+    native_window.makeKeyAndOrderFront(None);
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
-fn focus_palette_with_system_events() -> bool {
-    false
+fn show_palette_interactively(window: &tauri::WebviewWindow) -> tauri::Result<()> {
+    window.show()
 }
 
 fn place_palette_near_cursor(app: &AppHandle, window: &tauri::WebviewWindow) {
@@ -739,7 +890,7 @@ fn place_palette_near_cursor(app: &AppHandle, window: &tauri::WebviewWindow) {
 
 #[cfg(target_os = "macos")]
 fn configure_palette_window_for_fullscreen(window: &tauri::WebviewWindow) {
-    use objc2_app_kit::{NSWindow, NSWindowCollectionBehavior};
+    use objc2_app_kit::{NSWindow, NSWindowCollectionBehavior, NSStatusWindowLevel};
 
     let Ok(native_window) = window.ns_window() else {
         return;
@@ -749,25 +900,96 @@ fn configure_palette_window_for_fullscreen(window: &tauri::WebviewWindow) {
     };
 
     let behavior = native_window.collectionBehavior()
+        | NSWindowCollectionBehavior::CanJoinAllSpaces
         | NSWindowCollectionBehavior::FullScreenAuxiliary;
     native_window.setCollectionBehavior(behavior);
+    native_window.setLevel(NSStatusWindowLevel);
+    native_window.setHidesOnDeactivate(false);
 }
 
 #[cfg(not(target_os = "macos"))]
 fn configure_palette_window_for_fullscreen(_window: &tauri::WebviewWindow) {
 }
 
+#[cfg(target_os = "macos")]
+fn place_palette_near_cursor_with_tauri(_app: &AppHandle, window: &tauri::WebviewWindow) {
+    use objc2_app_kit::{NSEvent, NSScreen, NSWindow};
+    use objc2_foundation::{MainThreadMarker, NSPoint};
+
+    let Ok(native_window) = window.ns_window() else {
+        return;
+    };
+    let Some(native_window) = (unsafe { native_window.cast::<NSWindow>().as_ref() }) else {
+        return;
+    };
+    let Some(main_thread) = MainThreadMarker::new() else {
+        return;
+    };
+
+    let cursor = NSEvent::mouseLocation();
+    let screens = NSScreen::screens(main_thread);
+    let screen = screens
+        .iter()
+        .find(|screen| {
+            let frame = screen.frame();
+            cursor.x >= frame.origin.x
+                && cursor.x <= frame.origin.x + frame.size.width
+                && cursor.y >= frame.origin.y
+                && cursor.y <= frame.origin.y + frame.size.height
+        })
+        .or_else(|| NSScreen::mainScreen(main_thread))
+        .or_else(|| screens.iter().next());
+
+    let Some(screen) = screen else {
+        return;
+    };
+
+    let visible = screen.visibleFrame();
+    let window_frame = native_window.frame();
+    let width = if window_frame.size.width > 0.0 {
+        window_frame.size.width
+    } else {
+        380.0
+    };
+    let height = if window_frame.size.height > 0.0 {
+        window_frame.size.height
+    } else {
+        500.0
+    };
+    let margin = PALETTE_MARGIN;
+    let gap = PALETTE_CURSOR_GAP;
+    let min_x = visible.origin.x + margin;
+    let max_x = (visible.origin.x + visible.size.width - width - margin).max(min_x);
+    let min_y = visible.origin.y + margin;
+    let max_y = (visible.origin.y + visible.size.height - height - margin).max(min_y);
+    let right_x = cursor.x + gap;
+    let below_y = cursor.y - height - gap;
+    let preferred_x = if right_x + width <= visible.origin.x + visible.size.width - margin {
+        right_x
+    } else {
+        cursor.x - width - gap
+    };
+    let preferred_y = if below_y >= min_y {
+        below_y
+    } else {
+        cursor.y + gap
+    };
+    let x = preferred_x.max(min_x).min(max_x);
+    let y = preferred_y.max(min_y).min(max_y);
+
+    native_window.setFrameOrigin(NSPoint::new(x, y));
+}
+
+#[cfg(not(target_os = "macos"))]
 fn place_palette_near_cursor_with_tauri(app: &AppHandle, window: &tauri::WebviewWindow) {
     let Ok(cursor) = app.cursor_position() else {
         let _ = window.center();
         return;
     };
-
     let Ok(Some(monitor)) = app.monitor_from_point(cursor.x, cursor.y) else {
         let _ = window.center();
         return;
     };
-
     let Ok(window_size) = window.outer_size() else {
         let _ = window.center();
         return;
@@ -780,40 +1002,35 @@ fn place_palette_near_cursor_with_tauri(app: &AppHandle, window: &tauri::Webview
     let gap = (PALETTE_CURSOR_GAP * scale_factor).round() as i32;
     let window_width = window_size.width as i32;
     let window_height = window_size.height as i32;
-    let monitor_width = monitor_size.width as i32;
-    let monitor_height = monitor_size.height as i32;
-
     let min_x = monitor_pos.x + margin;
     let min_y = monitor_pos.y + margin;
-    let max_x = monitor_pos.x + monitor_width - window_width - margin;
-    let max_y = monitor_pos.y + monitor_height - window_height - margin;
+    let max_x = monitor_pos.x + monitor_size.width as i32 - window_width - margin;
+    let max_y = monitor_pos.y + monitor_size.height as i32 - window_height - margin;
     let cursor_x = cursor.x.round() as i32;
     let cursor_y = cursor.y.round() as i32;
-    let right_x = cursor_x + gap;
-    let below_y = cursor_y + gap;
-    let preferred_x = if right_x <= max_x {
-        right_x
+    let preferred_x = if cursor_x + gap <= max_x {
+        cursor_x + gap
     } else {
         cursor_x - window_width - gap
     };
-    let preferred_y = if below_y <= max_y {
-        below_y
+    let preferred_y = if cursor_y + gap <= max_y {
+        cursor_y + gap
     } else {
         cursor_y - window_height - gap
     };
-
     let x = clamp_i32(preferred_x, min_x, max_x);
     let y = clamp_i32(preferred_y, min_y, max_y);
 
-    let _ = window.set_position(PhysicalPosition { x, y });
+    let _ = window.set_position(tauri::PhysicalPosition { x, y });
 }
 
+#[cfg(not(target_os = "macos"))]
 fn clamp_i32(value: i32, min: i32, max: i32) -> i32 {
     if min > max {
-        return min;
+        min
+    } else {
+        value.max(min).min(max)
     }
-
-    value.max(min).min(max)
 }
 
 fn trim_history(items: &mut Vec<ClipboardItem>) {
@@ -1383,21 +1600,54 @@ fn now_millis() -> u64 {
 }
 
 #[cfg(target_os = "macos")]
-fn capture_clipboard_source_app() -> Option<String> {
-    let script = r#"
-tell application "System Events"
-  set frontProc to first application process whose frontmost is true
-  return name of frontProc
-end tell
-"#;
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn AXIsProcessTrusted() -> bool;
+    fn AXIsProcessTrustedWithOptions(options: *const std::ffi::c_void) -> bool;
+}
 
-    let process_name = run_osascript(script).ok()?.trim().to_string();
+#[cfg(target_os = "macos")]
+fn is_accessibility_trusted() -> bool {
+    unsafe { AXIsProcessTrusted() }
+}
 
-    if process_name.is_empty() || process_name == "easy-copy" || process_name == "EasyCopy" {
-        None
-    } else {
-        Some(process_name)
+#[cfg(not(target_os = "macos"))]
+fn is_accessibility_trusted() -> bool {
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn prompt_accessibility_permission() -> bool {
+    accessibility_trusted(true)
+}
+
+#[cfg(target_os = "macos")]
+fn accessibility_trusted(prompt: bool) -> bool {
+    use objc2::{class, msg_send, runtime::{AnyObject, Bool}};
+    use objc2_foundation::ns_string;
+
+    unsafe {
+        let key = ns_string!("AXTrustedCheckOptionPrompt");
+        let prompt_value = if prompt { Bool::YES } else { Bool::NO };
+        let prompt_num: *mut AnyObject =
+            msg_send![class!(NSNumber), numberWithBool: prompt_value];
+        let options: *const AnyObject = msg_send![
+            class!(NSDictionary),
+            dictionaryWithObject: prompt_num,
+            forKey: key
+        ];
+        AXIsProcessTrustedWithOptions(options.cast())
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn prompt_accessibility_permission() -> bool {
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn capture_clipboard_source_app() -> Option<String> {
+    capture_focus_target().map(|target| target.process_name)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1407,39 +1657,35 @@ fn capture_clipboard_source_app() -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn capture_focus_target() -> Option<FocusTarget> {
-    let script = r#"
-tell application "System Events"
-  set frontProc to first application process whose frontmost is true
-  set procName to name of frontProc
-  set roleName to ""
-  set subroleName to ""
-  try
-    set focusedElement to value of attribute "AXFocusedUIElement" of frontProc
-    if focusedElement is not missing value then
-      set roleName to role of focusedElement
-      try
-        set subroleName to subrole of focusedElement
-      end try
-    end if
-  end try
-  return procName & linefeed & roleName & linefeed & subroleName
-end tell
-"#;
+    use objc2_app_kit::NSWorkspace;
 
-    let output = run_osascript(script).ok()?;
-    let mut lines = output.lines();
-    let process_name = lines.next().unwrap_or_default().trim().to_string();
-    let role = lines.next().unwrap_or_default().trim().to_string();
-    let subrole = lines.next().unwrap_or_default().trim().to_string();
+    let workspace = NSWorkspace::sharedWorkspace();
+    let front_app = workspace.frontmostApplication()?;
+    let pid = front_app.processIdentifier();
 
-    if process_name.is_empty() || process_name == "easy-copy" || process_name == "EasyCopy" {
+    if pid <= 0 || pid == std::process::id() as i32 {
         return None;
     }
 
-    Some(FocusTarget {
-        process_name,
-        is_editable: role_is_editable(&role, &subrole),
-    })
+    if let Some(bundle_id) = front_app.bundleIdentifier() {
+        let bundle_str = bundle_id.to_string();
+        if bundle_str == LAUNCH_AGENT_LABEL {
+            return None;
+        }
+    }
+
+    let process_name = front_app
+        .localizedName()
+        .map(|name| name.to_string())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    if process_name == "easy-copy" || process_name == "EasyCopy" {
+        return None;
+    }
+
+    Some(FocusTarget { pid, process_name })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1449,17 +1695,23 @@ fn capture_focus_target() -> Option<FocusTarget> {
 
 #[cfg(target_os = "macos")]
 fn activate_focus_target(target: &FocusTarget) -> bool {
-    if target.process_name.is_empty() {
+    use objc2::{msg_send, runtime::Bool};
+    use objc2_app_kit::NSRunningApplication;
+
+    if target.pid <= 0 {
         return false;
     }
 
-    let escaped_process_name = escape_applescript_string(&target.process_name);
-    let script = format!(
-        r#"tell application "System Events" to set frontmost of process "{}" to true"#,
-        escaped_process_name
-    );
+    let Some(app) =
+        NSRunningApplication::runningApplicationWithProcessIdentifier(target.pid)
+    else {
+        return false;
+    };
 
-    run_osascript(&script).is_ok()
+    // NSApplicationActivateIgnoringOtherApps = 1 << 1
+    let options: usize = 1 << 1;
+    let activated: Bool = unsafe { msg_send![&app, activateWithOptions: options] };
+    activated.as_bool()
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1468,69 +1720,36 @@ fn activate_focus_target(_target: &FocusTarget) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn paste_into_focus_target(target: &FocusTarget) -> Result<(), String> {
-    if target.process_name.is_empty() {
-        return simulate_paste();
+fn wait_for_target_frontmost(target: &FocusTarget, timeout_ms: u64) {
+    use objc2_app_kit::NSWorkspace;
+
+    if target.pid <= 0 {
+        return;
     }
 
-    let escaped_process_name = escape_applescript_string(&target.process_name);
-    let script = format!(
-        r#"
-tell application "System Events"
-  if exists process "{}" then
-    set frontmost of process "{}" to true
-    delay 0.14
-    keystroke "v" using command down
-    return "ok"
-  end if
-end tell
-return "missing"
-"#,
-        escaped_process_name, escaped_process_name
-    );
-
-    match run_osascript(&script) {
-        Ok(output) if output.trim() == "ok" => Ok(()),
-        _ => {
-            let _ = activate_focus_target(target);
-            thread::sleep(Duration::from_millis(PASTE_DELAY_MS));
-            simulate_paste()
+    let deadline = now_millis().saturating_add(timeout_ms);
+    while now_millis() < deadline {
+        let is_front = NSWorkspace::sharedWorkspace()
+            .frontmostApplication()
+            .is_some_and(|app| app.processIdentifier() == target.pid);
+        if is_front {
+            return;
         }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn paste_into_focus_target(_target: &FocusTarget) -> Result<(), String> {
+fn wait_for_target_frontmost(_target: &FocusTarget, _timeout_ms: u64) {}
+
+#[cfg(target_os = "macos")]
+fn paste_into_focus_target(_target: Option<&FocusTarget>) -> Result<(), String> {
     simulate_paste()
 }
 
-#[cfg(target_os = "macos")]
-fn run_osascript(script: &str) -> Result<String, String> {
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
-        .map_err(|error| error.to_string())?;
-
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-#[cfg(target_os = "macos")]
-fn escape_applescript_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-fn role_is_editable(role: &str, subrole: &str) -> bool {
-    let value = format!("{} {}", role, subrole).to_lowercase();
-
-    value.contains("text")
-        || value.contains("search")
-        || value.contains("combo")
-        || value.contains("editable")
+#[cfg(not(target_os = "macos"))]
+fn paste_into_focus_target(_target: Option<&FocusTarget>) -> Result<(), String> {
+    simulate_paste()
 }
 
 #[cfg(target_os = "macos")]
@@ -1540,20 +1759,34 @@ fn simulate_paste() -> Result<(), String> {
         event_source::{CGEventSource, CGEventSourceStateID},
     };
 
+    const VIRTUAL_KEY_COMMAND: u16 = 0x37;
     const VIRTUAL_KEY_V: u16 = 0x09;
 
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .map_err(|_| "Failed to create a macOS keyboard event source.".to_string())?;
+    let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+        .or_else(|_| CGEventSource::new(CGEventSourceStateID::HIDSystemState))
+        .map_err(|_| "无法创建 macOS 键盘事件源。".to_string())?;
+
+    let cmd_down = CGEvent::new_keyboard_event(source.clone(), VIRTUAL_KEY_COMMAND, true)
+        .map_err(|_| "无法创建 Command 按下事件。".to_string())?;
+    cmd_down.set_flags(CGEventFlags::CGEventFlagCommand);
 
     let key_down = CGEvent::new_keyboard_event(source.clone(), VIRTUAL_KEY_V, true)
-        .map_err(|_| "Failed to create Cmd+V key down event.".to_string())?;
+        .map_err(|_| "无法创建 Cmd+V 按下事件。".to_string())?;
     key_down.set_flags(CGEventFlags::CGEventFlagCommand);
-    key_down.post(CGEventTapLocation::HID);
 
-    let key_up = CGEvent::new_keyboard_event(source, VIRTUAL_KEY_V, false)
-        .map_err(|_| "Failed to create Cmd+V key up event.".to_string())?;
+    let key_up = CGEvent::new_keyboard_event(source.clone(), VIRTUAL_KEY_V, false)
+        .map_err(|_| "无法创建 Cmd+V 抬起事件。".to_string())?;
     key_up.set_flags(CGEventFlags::CGEventFlagCommand);
+
+    let cmd_up = CGEvent::new_keyboard_event(source, VIRTUAL_KEY_COMMAND, false)
+        .map_err(|_| "无法创建 Command 抬起事件。".to_string())?;
+    cmd_up.set_flags(CGEventFlags::empty());
+
+    cmd_down.post(CGEventTapLocation::HID);
+    key_down.post(CGEventTapLocation::HID);
+    thread::sleep(Duration::from_millis(12));
     key_up.post(CGEventTapLocation::HID);
+    cmd_up.post(CGEventTapLocation::HID);
 
     Ok(())
 }

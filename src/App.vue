@@ -40,6 +40,7 @@ type ClipboardItem = {
 
 type PasteResult = {
   pasted: boolean;
+  needsAccessibility?: boolean;
 };
 
 type AppSettings = {
@@ -56,6 +57,9 @@ const READY_STATUS = "就绪";
 const history = ref<ClipboardItem[]>([]);
 const query = ref("");
 const selectedIndex = ref(0);
+const searchInputRef = ref<HTMLInputElement | null>(null);
+const hasAccessibilityPermission = ref(true);
+let accessibilityPollTimer: number | null = null;
 const isPasting = ref(false);
 const isSettingsOpen = ref(false);
 const isSavingSettings = ref(false);
@@ -106,6 +110,7 @@ watch(filteredItems, (items) => {
 onMounted(async () => {
   history.value = await invoke<ClipboardItem[]>("get_clipboard_history");
   appSettings.value = await invoke<AppSettings>("get_app_settings");
+  await refreshAccessibilityPermission();
 
   unlistenHistory = await listen<ClipboardItem[]>(
     "clipboard-history-updated",
@@ -117,17 +122,24 @@ onMounted(async () => {
   unlistenOpened = await listen("palette-opened", () => {
     query.value = "";
     selectedIndex.value = 0;
+    editingNoteItemId.value = null;
+    noteDraft.value = "";
+    noteErrorMessage.value = "";
     errorMessage.value = "";
     settingsErrorMessage.value = "";
     isSettingsOpen.value = false;
     isRecordingShortcut.value = false;
     setStatus(READY_STATUS);
+    void refreshAccessibilityPermission();
+    focusSearchInput();
+    scrollSelectedIntoView();
   });
 
   unlistenSettingsOpened = await listen("settings-opened", () => {
     settingsErrorMessage.value = "";
     isSettingsOpen.value = true;
     isRecordingShortcut.value = false;
+    void refreshAccessibilityPermission();
   });
 
   unlistenSettingsUpdated = await listen<AppSettings>(
@@ -138,6 +150,8 @@ onMounted(async () => {
   );
 
   window.addEventListener("keydown", handleKeydown);
+  window.addEventListener("focus", handleWindowFocus);
+  focusSearchInput();
 });
 
 onBeforeUnmount(() => {
@@ -146,13 +160,47 @@ onBeforeUnmount(() => {
   unlistenSettingsOpened?.();
   unlistenSettingsUpdated?.();
   window.removeEventListener("keydown", handleKeydown);
+  window.removeEventListener("focus", handleWindowFocus);
 
   if (statusTimer) {
     window.clearTimeout(statusTimer);
   }
+
+  if (accessibilityPollTimer !== null) {
+    window.clearInterval(accessibilityPollTimer);
+    accessibilityPollTimer = null;
+  }
 });
 
+function handleWindowFocus() {
+  void refreshAccessibilityPermission();
+}
+
+async function refreshAccessibilityPermission() {
+  try {
+    const trusted = await invoke<boolean>("check_accessibility_permission");
+    hasAccessibilityPermission.value = trusted;
+    if (trusted && errorMessage.value.includes("辅助功能")) {
+      errorMessage.value = "";
+    }
+  } catch {
+    // Ignore errors on non-macOS platforms
+  }
+}
+
+function focusSearchInput() {
+  requestAnimationFrame(() => {
+    if (!isSettingsOpen.value && editingNoteItemId.value === null) {
+      searchInputRef.value?.focus();
+    }
+  });
+}
+
 function handleKeydown(event: KeyboardEvent) {
+  if (event.isComposing || event.keyCode === 229) {
+    return;
+  }
+
   if (editingNoteItemId.value !== null) {
     if (event.key === "Escape") {
       event.preventDefault();
@@ -170,12 +218,28 @@ function handleKeydown(event: KeyboardEvent) {
     if (event.key === "Escape") {
       event.preventDefault();
       isSettingsOpen.value = false;
+      focusSearchInput();
     }
 
     return;
   }
 
-  const isEditableTarget = isKeyboardEventFromEditable(event);
+  if (
+    event.metaKey &&
+    !event.ctrlKey &&
+    !event.altKey &&
+    !event.shiftKey &&
+    /^[1-9]$/.test(event.key)
+  ) {
+    const quickIndex = Number(event.key) - 1;
+    const item = filteredItems.value[quickIndex];
+    if (item) {
+      event.preventDefault();
+      selectedIndex.value = quickIndex;
+      void pasteItem(item);
+      return;
+    }
+  }
 
   if (event.key === "ArrowDown") {
     event.preventDefault();
@@ -190,10 +254,6 @@ function handleKeydown(event: KeyboardEvent) {
   }
 
   if (event.key === "Enter") {
-    if (isEditableTarget) {
-      return;
-    }
-
     event.preventDefault();
     void pasteSelected();
     return;
@@ -201,6 +261,10 @@ function handleKeydown(event: KeyboardEvent) {
 
   if (event.key === "Escape") {
     event.preventDefault();
+    if (query.value) {
+      query.value = "";
+      return;
+    }
     void invoke("hide_palette");
   }
 }
@@ -238,6 +302,11 @@ function toggleSettingsPanel() {
   isSettingsOpen.value = !isSettingsOpen.value;
   settingsErrorMessage.value = "";
   isRecordingShortcut.value = false;
+  if (isSettingsOpen.value) {
+    void refreshAccessibilityPermission();
+  } else {
+    focusSearchInput();
+  }
 }
 
 function startShortcutRecording() {
@@ -380,20 +449,6 @@ function shortcutKeyFromEvent(event: KeyboardEvent) {
   return codeMap[event.code] || event.code;
 }
 
-function isKeyboardEventFromEditable(event: KeyboardEvent) {
-  const target = event.target;
-
-  if (!(target instanceof HTMLElement)) {
-    return false;
-  }
-
-  return (
-    target instanceof HTMLInputElement ||
-    target instanceof HTMLTextAreaElement ||
-    target.isContentEditable
-  );
-}
-
 function selectNext() {
   if (filteredItems.value.length === 0) {
     return;
@@ -432,6 +487,14 @@ async function pasteItem(item: ClipboardItem) {
 
   try {
     const result = await invoke<PasteResult>("paste_clipboard_item", { id: item.id });
+    if (result.needsAccessibility) {
+      hasAccessibilityPermission.value = false;
+      errorMessage.value =
+        "自动回填需要开启「辅助功能」权限，当前内容已复制到剪贴板。";
+      setStatus("已复制");
+      return;
+    }
+    hasAccessibilityPermission.value = true;
     setStatus(result.pasted ? "已粘贴" : "已复制");
   } catch (error) {
     errorMessage.value =
@@ -504,7 +567,31 @@ async function deleteItem(id: number) {
 }
 
 async function openAccessibilitySettings() {
-  await invoke("open_accessibility_settings");
+  if (accessibilityPollTimer !== null) {
+    window.clearInterval(accessibilityPollTimer);
+    accessibilityPollTimer = null;
+  }
+
+  try {
+    await invoke("open_accessibility_settings");
+    await refreshAccessibilityPermission();
+
+    let checks = 0;
+    accessibilityPollTimer = window.setInterval(() => {
+      checks += 1;
+      void refreshAccessibilityPermission();
+
+      if (checks >= 30 || hasAccessibilityPermission.value) {
+        if (accessibilityPollTimer !== null) {
+          window.clearInterval(accessibilityPollTimer);
+          accessibilityPollTimer = null;
+        }
+      }
+    }, 500);
+  } catch (error) {
+    errorMessage.value =
+      error instanceof Error ? error.message : String(error || "无法打开辅助功能设置。");
+  }
 }
 
 function startWindowDrag(event: MouseEvent) {
@@ -683,6 +770,7 @@ function setStatus(value: string) {
         >
           <Search class="shrink-0 text-zinc-400" :size="15" :stroke-width="1.8" />
           <input
+            ref="searchInputRef"
             v-model="query"
             class="h-full min-w-0 flex-1 bg-transparent text-[13px] outline-none placeholder:text-zinc-400"
             placeholder="搜索剪贴板"
@@ -710,6 +798,25 @@ function setStatus(value: string) {
         </div>
       </div>
 
+      <div
+        v-else-if="!hasAccessibilityPermission && !isSettingsOpen"
+        class="border-b border-amber-200/80 bg-amber-50/95 px-3.5 py-2"
+      >
+        <div class="flex items-center gap-2 text-[12px] leading-5 text-amber-900">
+          <AlertCircle class="shrink-0" :size="14" :stroke-width="1.8" />
+          <p class="min-w-0 flex-1 truncate">
+            未开启辅助功能权限，点击记录无法自动回填
+          </p>
+          <button
+            class="shrink-0 rounded-md bg-amber-900/10 px-2 py-0.5 text-[11px] font-medium text-amber-900 transition hover:bg-amber-900/20 active:scale-[0.98]"
+            type="button"
+            @click="openAccessibilitySettings"
+          >
+            去开启
+          </button>
+        </div>
+      </div>
+
       <div v-if="isSettingsOpen" class="min-h-0 flex-1 overflow-y-auto p-3.5">
         <div
           v-if="settingsErrorMessage"
@@ -719,6 +826,47 @@ function setStatus(value: string) {
         </div>
 
         <div class="space-y-3">
+          <section
+            class="overflow-hidden rounded-xl border border-white/80 bg-white/65 backdrop-blur-xl"
+          >
+            <button
+              class="flex min-h-[58px] w-full items-center gap-3 px-3 text-left transition hover:bg-zinc-100/70 active:scale-[0.995]"
+              type="button"
+              @click="openAccessibilitySettings"
+            >
+              <span
+                class="flex size-8 shrink-0 items-center justify-center rounded-lg border border-zinc-200/80 bg-white/80 text-zinc-600"
+              >
+                <MousePointerClick :size="15" :stroke-width="1.8" />
+              </span>
+              <span class="min-w-0 flex-1">
+                <span class="block text-[13px] font-medium leading-5 text-zinc-800">
+                  辅助功能权限（自动回填）
+                </span>
+                <span
+                  class="block text-[11px] leading-4"
+                  :class="hasAccessibilityPermission ? 'text-emerald-600' : 'text-amber-700'"
+                >
+                  {{
+                    hasAccessibilityPermission
+                      ? "已授权，点击记录可直接回填至输入框"
+                      : "未授权，点击前往系统设置开启"
+                  }}
+                </span>
+              </span>
+              <span
+                class="shrink-0 rounded-md border px-2 py-1 text-[11px]"
+                :class="
+                  hasAccessibilityPermission
+                    ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                    : 'border-amber-300 bg-amber-50 text-amber-800'
+                "
+              >
+                {{ hasAccessibilityPermission ? "已开启" : "去设置" }}
+              </span>
+            </button>
+          </section>
+
           <section
             class="overflow-hidden rounded-xl border border-white/80 bg-white/65 backdrop-blur-xl"
           >
@@ -852,8 +1000,11 @@ function setStatus(value: string) {
               <button
                 class="grid min-w-0 grid-cols-[auto_1fr] items-center gap-2.5 px-2.5 py-2 text-left active:scale-[0.995]"
                 type="button"
-                @pointerdown.prevent.stop="pasteItem(item)"
-                @click.prevent.stop="pasteItem(item)"
+                @mousedown.prevent
+                @click.prevent.stop="
+                  selectedIndex = index;
+                  pasteItem(item);
+                "
               >
                 <span
                   v-if="item.kind === 'image'"
