@@ -561,6 +561,33 @@ fn open_accessibility_settings() -> Result<(), String> {
     }
 }
 
+#[tauri::command]
+fn repair_accessibility_permission() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("tccutil")
+            .args(["reset", "Accessibility", "com.blue.easycopy"])
+            .output()
+            .map_err(|error| format!("无法重置 EasyCopy 的辅助功能授权：{error}"))?;
+
+        if !output.status.success() {
+            let details = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("重置 EasyCopy 的辅助功能授权失败：{details}"));
+        }
+
+        Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+            .spawn()
+            .map_err(|error| format!("授权已重置，但无法打开系统设置：{error}"))?;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("Accessibility settings are only available on macOS.".to_string())
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -607,6 +634,7 @@ pub fn run() {
             paste_clipboard_item,
             check_accessibility_permission,
             request_accessibility_permission,
+            repair_accessibility_permission,
             open_accessibility_settings
         ])
         .run(tauri::generate_context!())

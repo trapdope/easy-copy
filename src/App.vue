@@ -594,6 +594,20 @@ async function openAccessibilitySettings() {
   }
 }
 
+async function repairAccessibilityPermission() {
+  settingsErrorMessage.value = "";
+
+  try {
+    await invoke("repair_accessibility_permission");
+    hasAccessibilityPermission.value = false;
+    settingsErrorMessage.value =
+      "旧授权记录已重置。请先移除列表中的旧版 EasyCopy，再通过“+”添加 /Applications/EasyCopy.app 并开启授权。完成后重启 EasyCopy。";
+  } catch (error) {
+    settingsErrorMessage.value =
+      error instanceof Error ? error.message : String(error || "重置旧授权失败。");
+  }
+}
+
 function startWindowDrag(event: MouseEvent) {
   if (event.button !== 0) {
     return;
@@ -866,6 +880,14 @@ function setStatus(value: string) {
               </span>
             </button>
           </section>
+
+          <button
+            class="min-h-9 rounded-lg border border-zinc-200 bg-white/70 px-3 text-[12px] text-zinc-700 transition hover:bg-zinc-100"
+            type="button"
+            @click="repairAccessibilityPermission"
+          >
+            修复旧版本授权
+          </button>
 
           <section
             class="overflow-hidden rounded-xl border border-white/80 bg-white/65 backdrop-blur-xl"
